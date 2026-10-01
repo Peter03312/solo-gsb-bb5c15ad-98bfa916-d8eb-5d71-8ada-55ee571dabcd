@@ -105,6 +105,21 @@ CREATE TABLE IF NOT EXISTS measurements (
 CREATE INDEX IF NOT EXISTS idx_meas_exhibit_status ON measurements (exhibit_id, status);
 CREATE INDEX IF NOT EXISTS idx_meas_plan ON measurements (plan_id);
 
+-- 停灯记录：已实际发生的关灯时段，只扣减所属计划尚未被已确认实测覆盖的估算剂量。
+-- 记录一经登记永久保留，不提供修改/作废/删除；排期重叠判断仍以原计划开灯窗为准。
+CREATE TABLE IF NOT EXISTS light_blackouts (
+    id              BIGSERIAL PRIMARY KEY,
+    plan_id         BIGINT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    start_ts        TIMESTAMPTZ NOT NULL,
+    end_ts          TIMESTAMPTZ NOT NULL CHECK (end_ts > start_ts),
+    reason          TEXT NOT NULL,
+    created_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_blackout_exhibit_time ON light_blackouts (exhibit_id, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_blackout_plan ON light_blackouts (plan_id);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,

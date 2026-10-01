@@ -68,6 +68,18 @@ test('实测窗从计划窗扣除后仅剩剩余区间', () => {
 });
 
 // 4) 时间重叠判断（左闭右开，相接不重叠）
+test('区间交集只保留重叠部分，相接为空', () => {
+  const t1 = new Date('2026-03-01T01:00:00Z').getTime();
+  const t2 = new Date('2026-03-01T09:00:00Z').getTime();
+  assert.deepStrictEqual(
+    dosing.intersectIntervals([{ start: t1, end: t2 }], [{ start: t2, end: t2 + 1 }]),
+    []
+  );
+  assert.deepStrictEqual(
+    dosing.intersectIntervals([{ start: t1, end: t2 + 1 }], [{ start: t2, end: t2 + 2 }]),
+    [{ start: t2, end: t2 + 1 }]
+  );
+});
 test('相接区间不算重叠，相交才算', () => {
   const t1 = new Date('2026-03-01T01:00:00Z').getTime();
   const t2 = new Date('2026-03-01T09:00:00Z').getTime();

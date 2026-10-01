@@ -40,6 +40,7 @@ function fingerprintSnapshot(snapshot) {
   const payload = {
     currentLimit: snapshot.currentLimit,
     measurements: snapshot.measurements,
+    blackouts: snapshot.blackouts || [],
     plans: snapshot.plans,
     startedPlanIds: snapshot.startedPlanIds,
   };

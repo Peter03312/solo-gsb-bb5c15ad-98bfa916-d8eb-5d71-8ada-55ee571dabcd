@@ -16,6 +16,7 @@ const {
   getPlan,
   getOccupyingPlans,
   validateMeasurementWindow,
+  findOverlappingBlackout,
   computeOccupancy,
   plansToFlag,
 } = require('../service');
@@ -125,6 +126,13 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         throw new ConflictError(`与已登记实测 #${clashRows[0].id} 时间重叠，确认被拒绝`, {
           overlappingMeasurementId: clashRows[0].id,
         });
+      }
+      const blackoutClash = await findOverlappingBlackout(client, plan.exhibit_id, start, end);
+      if (blackoutClash) {
+        throw new ConflictError(
+          `与停灯记录 #${blackoutClash.id}（计划 #${blackoutClash.plan_id}）时间重叠，确认被拒绝`,
+          { overlappingBlackoutId: blackoutClash.id, overlappingPlanId: blackoutClash.plan_id }
+        );
       }
 
       // 预演确认后的额度占用

@@ -108,6 +108,22 @@
             <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
             <tbody id="detail-meas-tbody"></tbody>
           </table>
+
+          <h4>停灯记录与年度扣减</h4>
+          <form id="blackout-form" class="inline-form conservator-only">
+            <select name="planId" id="blackout-plan-select" required></select>
+            <input name="startDate" type="date" required />
+            <input name="startTime" type="time" required />
+            <input name="endDate" type="date" />
+            <input name="endTime" type="time" required />
+            <input name="reason" maxlength="1000" placeholder="必填停灯原因" required />
+            <button class="primary" type="submit">登记停灯</button>
+          </form>
+          <p class="muted small conservator-only">仅可登记已经结束的停灯；记录永久保留、不可修改或删除。只扣减该计划未被已确认实测覆盖的估算时段，不释放原计划排期。</p>
+          <table class="data">
+            <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>原因</th><th>按年扣减量</th><th>登记人</th></tr></thead>
+            <tbody id="detail-blackout-tbody"></tbody>
+          </table>
         </div>
       </section>
 

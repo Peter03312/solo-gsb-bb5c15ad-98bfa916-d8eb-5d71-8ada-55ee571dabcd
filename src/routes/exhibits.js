@@ -49,13 +49,63 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
       [exhibitId]
     )
   ).rows.map(serializeMeasurement);
+  const blackoutRows = (
+    await client.query(
+      `SELECT * FROM light_blackouts
+        WHERE exhibit_id = $1
+        ORDER BY start_ts DESC, id DESC`,
+      [exhibitId]
+    )
+  ).rows;
+  for (const b of blackoutRows) {
+    const planTitleRow = await client.query('SELECT title FROM plans WHERE id = $1', [b.plan_id]);
+    const creatorRow = b.created_by
+      ? await client.query('SELECT display_name FROM users WHERE id = $1', [b.created_by])
+      : { rows: [] };
+    b.plan_title = planTitleRow.rows[0] ? planTitleRow.rows[0].title : null;
+    b.creator_name = creatorRow.rows[0] ? creatorRow.rows[0].display_name : null;
+  }
+  const activePlanStatuses = new Set(['approved', 'pending_review']);
+  const planById = new Map(plans.map((p) => [Number(p.id), p]));
+  const blackouts = blackoutRows.map((b) => {
+    const plan = planById.get(Number(b.plan_id));
+    const active = plan && activePlanStatuses.has(plan.status);
+    const source = active
+      ? occupancy.sources.find((s) => s.kind === 'blackout' && s.id === b.id)
+      : null;
+    return {
+      id: b.id,
+      planId: b.plan_id,
+      exhibitId: b.exhibit_id,
+      planTitle: b.plan_title,
+      start: tsToWallString(new Date(b.start_ts).getTime()),
+      end: tsToWallString(new Date(b.end_ts).getTime()),
+      reason: b.reason,
+      createdBy: b.created_by,
+      creatorName: b.creator_name,
+      createdAt: b.created_at,
+      immutable: true,
+      activePlan: !!active,
+      // 已不占用计划（取消/驳回）中的停灯仍保留展示，但不再有当前年度扣减。
+      yearlyDeduction: source ? source.yearly : {},
+    };
+  });
+  const blackoutDeductionsByYear = {};
+  for (const s of occupancy.sources.filter((x) => x.kind === 'blackout')) {
+    for (const [year, dose] of Object.entries(s.yearly || {})) {
+      blackoutDeductionsByYear[year] =
+        Math.round(((blackoutDeductionsByYear[year] || 0) + dose) * 1000) / 1000;
+    }
+  }
 
   return {
     exhibit,
     years: occupancy.years,
     sources: occupancy.sources,
+    blackoutDeductionsByYear,
     plans,
     measurements,
+    blackouts,
   };
 }
 

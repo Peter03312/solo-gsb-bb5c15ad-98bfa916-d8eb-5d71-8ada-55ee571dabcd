@@ -170,7 +170,18 @@ async function approve(req, res) {
       start: new Date(m.start_ts).getTime(),
       end: new Date(m.end_ts).getTime(),
     }));
-    const remainingWindows = subtractIntervals(targetWindows, selfMeas);
+    const { rows: blackoutRows } = await client.query(
+      'SELECT start_ts, end_ts FROM light_blackouts WHERE plan_id = $1',
+      [id]
+    );
+    const selfBlackouts = blackoutRows.map((b) => ({
+      start: new Date(b.start_ts).getTime(),
+      end: new Date(b.end_ts).getTime(),
+    }));
+    const remainingWindows = subtractIntervals(
+      subtractIntervals(targetWindows, selfMeas),
+      selfBlackouts
+    );
     const addedYearly = yearMapToObject(doseByYear(remainingWindows, Number(plan.estimated_lux)));
 
     const overflows = buildOverflows(occupancy.used, occupancy.limits, addedYearly);

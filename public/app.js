@@ -200,7 +200,9 @@ function renderDetail() {
       <td class="mono">${fmtN(y.used)}</td>
       <td class="mono">${y.remaining === null ? '—' : fmtN(y.remaining)}</td>
       <td>${y.limit === null ? '<span class="muted">无法核算</span>'
-        : y.over ? `<b style="color:#b42318">超限 ${fmtN(y.used - y.limit)}</b>` : '正常'}</td>
+        : y.over ? `<b style="color:#b42318">超限 ${fmtN(y.used - y.limit)}</b>` : '正常'}
+        ${d.blackoutDeductionsByYear && d.blackoutDeductionsByYear[y.year]
+          ? `<div class="small muted">停灯已扣 ${fmtN(d.blackoutDeductionsByYear[y.year])}</div>` : ''}</td>
     </tr>`).join('') : '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
 
   $('#sources-list').innerHTML = (d.sources || []).map((s) => {
@@ -209,16 +211,23 @@ function renderDetail() {
         实测 #${s.id}（计划 #${s.planId}）：${esc(s.start)} ~ ${esc(s.end)}，${s.lux} lx
         <div class="source-doses">已确认实测剂量：${yearlyText(s.yearly)}</div></div>`;
     }
+    if (s.kind === 'blackout') {
+      const hasDeduction = Object.keys(s.yearly || {}).length > 0;
+      return `<div class="source-item">
+        停灯扣减 #${s.id}（计划 #${s.planId}）：${esc(s.start)} ~ ${esc(s.end)}
+        <div class="source-doses">${hasDeduction ? `扣减估算：${yearlyText(s.yearly)}` : '无可扣估算（可能已被实测覆盖或计划已不占用）'}</div></div>`;
+    }
     return `<div class="source-item plan ${s.status}">
       估算残余 · 计划 #${s.id}「${esc(s.title)}」${badge(s.status)}
       ：${esc(s.startDate)} ~ ${esc(s.endDate)}，每日 ${(s.periods || []).map(esc).join('、')}，${s.lux} lx
-      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖部分）</div></div>`;
+      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖与停灯部分）</div></div>`;
   }).join('') || '<p class="muted">暂无占用</p>';
 
   $('#detail-plan-tbody').innerHTML = d.plans.map(planRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无计划</td></tr>';
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
+  renderBlackouts();
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
@@ -337,6 +346,46 @@ function measRow(m) {
       : '<span class="muted">—</span>'}</td>
   </tr>`;
 }
+
+function renderBlackouts() {
+  const d = state.detail;
+  const select = $('#blackout-plan-select');
+  if (select) {
+    select.innerHTML = (d.plans || [])
+      .filter((p) => ['approved', 'pending_review'].includes(p.status))
+      .map((p) => `<option value="${p.id}">#${p.id} ${esc(p.title)}</option>`)
+      .join('') || '<option value="">暂无可登记停灯的计划</option>';
+  }
+  $('#detail-blackout-tbody').innerHTML = (d.blackouts || []).map((b) => `
+    <tr>
+      <td>${b.id}</td>
+      <td>#${b.planId} ${esc(b.planTitle || '')}${b.activePlan ? '' : '<div class="small muted">计划已不占用</div>'}</td>
+      <td>${esc(b.start)}</td><td>${esc(b.end)}</td>
+      <td>${esc(b.reason)}</td>
+      <td>${yearlyText(b.yearlyDeduction)}</td>
+      <td>${esc(b.creatorName || '—')}</td>
+    </tr>`).join('') || '<tr><td colspan="7" class="muted">暂无停灯记录</td></tr>';
+}
+
+$('#blackout-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    await api('POST', '/api/blackouts', {
+      planId: Number(fd.get('planId')),
+      startDate: fd.get('startDate'),
+      startTime: fd.get('startTime'),
+      endDate: fd.get('endDate') || fd.get('startDate'),
+      endTime: fd.get('endTime'),
+      reason: fd.get('reason'),
+    });
+    e.target.reset();
+    const detail = await api('GET', `/api/exhibits/${state.detail.exhibit.id}`);
+    state.detail = detail;
+    renderDetail();
+    flash('success', '停灯记录已登记，估算残余已按自然年扣减');
+  } catch (err) { flash('error', err.message); }
+});
 
 $('#limit-form').addEventListener('submit', async (e) => {
   e.preventDefault();

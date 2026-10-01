@@ -108,6 +108,26 @@ function anyIntersect(windowsA, windowsB) {
   return false;
 }
 
+/** 两组区间的交集（返回已合并区间）。 */
+function intersectIntervals(windowsA, windowsB) {
+  const out = [];
+  for (const a of windowsA) {
+    for (const b of windowsB) {
+      const start = Math.max(a.start, b.start);
+      const end = Math.min(a.end, b.end);
+      if (end > start) out.push({ start, end });
+    }
+  }
+  out.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged = [];
+  for (const w of out) {
+    const last = merged[merged.length - 1];
+    if (last && w.start <= last.end) last.end = Math.max(last.end, w.end);
+    else merged.push(w);
+  }
+  return merged;
+}
+
 /**
  * 把时间窗按墙上自然年切分，返回 Map<year, 分钟数>。
  * 年界（本地 1 月 1 日 00:00）= Date.UTC(y,0,1) - offset。
@@ -197,6 +217,7 @@ module.exports = {
   intersects,
   containsInterval,
   anyIntersect,
+  intersectIntervals,
   splitMinutesByYear,
   doseByYear,
   subtractIntervals,
