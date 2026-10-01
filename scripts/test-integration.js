@@ -1066,6 +1066,347 @@ async function runFlow() {
   r = await call('GET', `/api/adjustments/${adjN}`, null, 'i');
   assert(r.body.adjustment.status === 'pending', '失败后合规一方的申请也仍待审');
 
+  // =======================================================================
+  // 停灯（blackout）登记：保管员登记已发生停灯时段，仅扣估算、不动实测/排期
+  // 使用动态日期（基于当前墙上时间），保证“结束不晚于当前时间”可测
+  // =======================================================================
+  const config2 = require('../src/config');
+  const dosing2 = require('../src/dosing');
+  // 当前墙上时间的 {ymd,minute}
+  const wallNow = dosing2.tsToWall(Date.now());
+  const wallDaysAgo = (n) => dosing2.tsToWall(Date.now() - n * 86400000);
+  const wallDaysAhead = (n) => dosing2.tsToWall(Date.now() + n * 86400000);
+  const hhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+  void config2;
+
+  const exBk = await createExhibit('停灯展品');
+  const yNow = Number(wallNow.ymd.slice(0, 4));
+  await call('POST', `/api/exhibits/${exBk}/limits`, { year: yNow - 1, limitLxh: 100000 }, 'c');
+  await call('POST', `/api/exhibits/${exBk}/limits`, { year: yNow, limitLxh: 100000 }, 'c');
+  await call('POST', `/api/exhibits/${exBk}/limits`, { year: yNow + 1, limitLxh: 100000 }, 'c');
+
+  // 承载计划：覆盖昨天/今天/明天，每天 09:00-17:00，100lx（计划已开始）
+  const d0 = wallDaysAgo(1).ymd;
+  const d1 = wallNow.ymd;
+  const d2 = wallDaysAhead(1).ymd;
+  const bkPlan = await submitPlan(exBk, '停灯承载计划', d0, d2, ['09:00-17:00'], 100);
+  await approvePlan(bkPlan);
+  // 另一条已批准计划（不同日期），用于跨计划停灯互斥
+  const d3 = wallDaysAhead(3).ymd;
+  const bkOther = await submitPlan(exBk, '停灯另一计划', d3, d3, ['09:00-17:00'], 100);
+  await approvePlan(bkOther);
+  // 待批准计划不能登记停灯
+  const bkSubmitted = await submitPlan(exBk, '待批准不停灯', wallDaysAhead(10).ymd,
+    wallDaysAhead(10).ymd, ['09:00-12:00'], 100);
+
+  // ---- 权限与输入校验 ----
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '10:00',
+    endDate: d0, endTime: '12:00', reason: '设备检修',
+  }, 'i');
+  assert(r.status === 403, '布展员不能登记停灯（只读）');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkSubmitted, startDate: wallDaysAhead(10).ymd, startTime: '10:00',
+    endDate: wallDaysAhead(10).ymd, endTime: '11:00', reason: 'x',
+  }, 'c');
+  assert(r.status === 400 && /已批准或待复核/.test(r.body.error), '待批准计划登记停灯被拒');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '12:00',
+    endDate: d0, endTime: '12:00', reason: '设备检修',
+  }, 'c');
+  assert(r.status === 400 && /起点须早于终点/.test(r.body.error), '零时长停灯被拒');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '12:00',
+    endDate: d0, endTime: '11:00', reason: '设备检修',
+  }, 'c');
+  assert(r.status === 400 && /起点须早于终点/.test(r.body.error), '起点晚于终点被拒');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d2, startTime: '09:00',
+    endDate: d2, endTime: '17:00', reason: '设备检修',
+  }, 'c');
+  assert(r.status === 400 && /晚于当前时间/.test(r.body.error), '结束晚于当前时间被拒（只能登记已发生）');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '08:00',
+    endDate: d0, endTime: '10:00', reason: '设备检修',
+  }, 'c');
+  assert(r.status === 400 && /开灯窗/.test(r.body.error), '停灯超出开灯窗（起点在窗外）被拒');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '16:00',
+    endDate: d0, endTime: '17:30', reason: '设备检修',
+  }, 'c');
+  assert(r.status === 400 && /开灯窗/.test(r.body.error), '停灯超出开灯窗（终点在窗外）被拒');
+
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '10:00',
+    endDate: d0, endTime: '12:00',
+  }, 'c');
+  assert(r.status === 400 && /停灯原因/.test(r.body.error), '停灯原因必填');
+
+  // ---- 正常登记：昨天 10:00-12:00，100lx 估算扣减 200 ----
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '10:00',
+    endDate: d0, endTime: '12:00', reason: '灯具故障检修',
+  }, 'c');
+  assert(r.status === 201, '停灯登记成功');
+  const bk1 = r.body.blackout.id;
+  assert(r.body.blackout.yearly[d0.slice(0, 4)] === 200,
+    '停灯记录带按年扣减量（200）：' + JSON.stringify(r.body.blackout.yearly));
+  assert(r.body.blackouts.some((b) => b.id === bk1 && b.reason === '灯具故障检修'),
+    '展品详情列出停灯记录');
+  assert((r.body.blackoutDeductionYearly[d0.slice(0, 4)] || 0) === 200,
+    `展品详情各年停灯扣减量：${d0.slice(0, 4)} 年=200，实际=${JSON.stringify(r.body.blackoutDeductionYearly)}`);
+
+  // 计划估算残余：该计划 3 天共 2400，扣停灯 200 后残余 2200（此时无实测）
+  const planSrc = r.body.sources.find((s) => s.kind === 'plan' && s.id === bkPlan);
+  assert(Object.values(planSrc.yearly).reduce((a, b) => a + b, 0) === 2200,
+    `停灯从所属计划估算中扣除：总残余 2200，实际 ${JSON.stringify(planSrc.yearly)}`);
+
+  // ---- 停灯不释放排期：开灯窗仍与另一同窗计划互斥 ----
+  r = await call('POST', '/api/plans', {
+    exhibitId: exBk, title: '撞停灯承载计划窗', startDate: d0, endDate: d0,
+    periods: ['10:30-11:30'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 409, '停灯不释放原计划排期占用：同窗新计划提交仍被拒');
+
+  // ---- 与其他停灯相交被拒（同计划）----
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '11:00',
+    endDate: d0, endTime: '13:00', reason: '重复检修',
+  }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingBlackouts.some((b) => b.id === bk1),
+    '与其他停灯记录相交被拒并指出冲突记录');
+
+  // 相接不相交：12:00-13:00 可登记
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '12:00',
+    endDate: d0, endTime: '13:00', reason: '继续检修',
+  }, 'c');
+  assert(r.status === 201, '端点相接的停灯时段可登记');
+  const bk2 = r.body.blackout.id;
+
+  // ---- 未作废实测碰到停灯被拒（录入路径，停灯在先）----
+  r = await call('POST', '/api/measurements', {
+    planId: bkPlan, startDate: d0, startTime: '11:00',
+    endDate: d0, endTime: '12:30', actualLux: 100,
+  }, 'c');
+  assert(r.status === 409 && /停灯/.test(r.body.error), '实测录入碰到停灯时段被拒');
+
+  // ---- 未作废实测在先，停灯登记碰到实测（含待确认草稿）被拒 ----
+  // 昨天 14:00-16:00 录一条草稿实测
+  r = await call('POST', '/api/measurements', {
+    planId: bkPlan, startDate: d0, startTime: '14:00',
+    endDate: d0, endTime: '16:00', actualLux: 80,
+  }, 'c');
+  assert(r.status === 201, '停灯窗外录入草稿实测');
+  const bkMeasDraft = r.body.measurement.id;
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '15:00',
+    endDate: d0, endTime: '15:30', reason: '撞上草稿实测',
+  }, 'c');
+  assert(r.status === 409 && r.body.details.overlappingMeasurements.some((m) => m.id === bkMeasDraft),
+    '停灯碰到待确认实测也被拒，并指出冲突实测');
+
+  // ---- 停灯只扣估算，不减已确认实测（实测与停灯互斥，用相邻时段验证）----
+  // 昨天 09:00-10:00 录入并确认实测 200lx = 200（与 10-12 停灯相接，不相交）
+  r = await call('POST', '/api/measurements', {
+    planId: bkPlan, startDate: d0, startTime: '09:00',
+    endDate: d0, endTime: '10:00', actualLux: 200,
+  }, 'c');
+  assert(r.status === 201, '录入昨天上午实测（与停灯相接）');
+  const bkMeasToday = r.body.measurement.id;
+  // 停灯登记与实测时段互斥：09:30-10:30 同时覆盖实测与停灯
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '09:30',
+    endDate: d0, endTime: '10:30', reason: '撞实测与停灯',
+  }, 'c');
+  assert(r.status === 409 &&
+    r.body.details.overlappingMeasurements.some((m) => m.id === bkMeasToday) &&
+    r.body.details.overlappingBlackouts.some((b) => b.id === bk1),
+    '停灯登记同时撞上实测与既有停灯时，一次性指出两类冲突');
+  await call('POST', `/api/measurements/${bkMeasToday}/confirm`, {}, 'c');
+
+  // 与已确认实测相接的停灯可登记：16:00-16:30（14-16 草稿实测相接于 16:00）
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '16:00',
+    endDate: d0, endTime: '16:30', reason: '补登傍晚停灯',
+  }, 'c');
+  assert(r.status === 201, `与草稿实测相接的停灯可登记（实际 ${r.status} ${r.body && r.body.error}）`);
+  const bk3 = r.body.blackout.id;
+
+  // 该年剂量核对（全部落在 d0 一天）：
+  //   总窗 8h；已确认实测 200lx*1h=200 计量；草稿 80lx*2h=160 仍由估算占位；
+  //   停灯 10-12(200) + 12-13(100) + 16-16:30(50) = 350
+  //   估算残余 = 800 − 已确认实测 1h*100=100 − 停灯 350 = 350
+  //   （草稿实测时段仍按估算 100lx 计 200，且与停灯不重叠）
+  r = await call('GET', `/api/exhibits/${exBk}`, null, 'i');
+  const bkYearKey = d0.slice(0, 4);
+  const bkSrc = r.body.sources.find((s) => s.kind === 'plan' && s.id === bkPlan);
+  // 计划跨 3 天可能跨年，用总残余求和验证
+  const residueSum = Object.values(bkSrc.yearly).reduce((a, b) => a + b, 0);
+  assert(residueSum === 350 + 1600, `停灯+实测统一扣减后计划总残余 1950，实际 ${residueSum}`);
+  assert(Object.values(r.body.blackoutDeductionYearly).reduce((a, b) => a + b, 0) === 350,
+    `各年停灯扣减合计 350，实际 ${JSON.stringify(r.body.blackoutDeductionYearly)}`);
+  // 已确认实测剂量不被停灯削减：仍为 200
+  const measSrc = r.body.sources.find((s) => s.kind === 'measurement' && s.id === bkMeasToday);
+  assert(Object.values(measSrc.yearly).reduce((a, b) => a + b, 0) === 200,
+    '已确认实测剂量不受停灯影响（200）');
+  void bkYearKey;
+  void bk3;
+
+  // ---- 跨年停灯按自然年拆分：另建覆盖去年末/今年初的已批准计划 ----
+  const crossStart = wallDaysAgo(2).ymd;
+  // 找一个去年12/31至今年1/1 的窗口：动态取“当前日期前推到年末边界”过于复杂，
+  // 直接用 wallDaysAgo(2) 与 wallDaysAgo(1)，若两者跨年则验证拆分；否则跳过 API 拆分，
+  // 由下面固定 2030→2031 的 service 层场景保证。
+  if (crossStart.slice(0, 4) !== d0.slice(0, 4)) {
+    const cp = await submitPlan(exBk, '跨年停灯计划', crossStart, d0, ['09:00-17:00'], 100);
+    await approvePlan(cp);
+    r = await call('POST', '/api/blackouts', {
+      planId: cp, startDate: crossStart, startTime: '09:00',
+      endDate: d0, endTime: '17:00', reason: '跨年连续停灯',
+    }, 'c');
+    assert(r.status === 201, '跨年停灯登记成功');
+    const yKeys = Object.keys(r.body.blackout.yearly);
+    assert(yKeys.length === 2, '跨年停灯扣减量按两个自然年拆分：' + JSON.stringify(r.body.blackout.yearly));
+  }
+
+  // ---- 停灯记录不可改删；布展员只读 ----
+  r = await call('DELETE', `/api/blackouts/${bk1}`, {}, 'c');
+  assert(r.status === 400 && /不可删除/.test(r.body.error), '停灯记录不可删除');
+  r = await call('PUT', `/api/blackouts/${bk1}`, { reason: '改' }, 'c');
+  assert(r.status === 400 && /不可修改/.test(r.body.error), '停灯记录不可修改');
+  r = await call('GET', `/api/blackouts?exhibitId=${exBk}`, null, 'i');
+  assert(r.status === 200 && r.body.blackouts.some((b) => b.id === bk1),
+    '布展员可只读查询停灯记录');
+  assert(r.body.blackouts.every((b) => b.yearly), '停灯列表逐条带按年扣减量');
+  r = await call('GET', `/api/blackouts?planId=${bkPlan}`, null, 'c');
+  assert(r.body.blackouts.every((b) => b.planId === bkPlan), '可按计划过滤停灯记录');
+
+  // ---- 计划取消后停灯保留、不再扣占用 ----
+  await call('POST', `/api/plans/${bkOther}/cancel`, { reason: '停灯保留验证' }, 'c');
+  r = await call('POST', '/api/blackouts', {
+    planId: bkPlan, startDate: d0, startTime: '13:00',
+    endDate: d0, endTime: '14:00', reason: '与12-13相接',
+  }, 'c');
+  assert(r.status === 201, '再登记一条停灯（13-14）用于后续核对');
+  // bkOther 没有停灯；改为取消 bkPlan 会连带其停灯不再计入占用（记录仍列出）
+  await call('POST', `/api/plans/${bkPlan}/cancel`, {}, 'c');
+  r = await call('GET', `/api/exhibits/${exBk}`, null, 'i');
+  assert(r.body.blackouts.length >= 4, '计划取消后停灯记录仍保留在展品详情');
+  assert(!r.body.sources.some((s) => s.kind === 'plan' && s.id === bkPlan),
+    '取消计划不再列估算残余占用');
+  assert(Object.values(r.body.blackoutDeductionYearly).reduce((a, b) => a + b, 0) === 0,
+    '取消后停灯不再扣减年度占用');
+  const keptBk = r.body.blackouts.find((b) => b.id === bk1);
+  assert(keptBk && keptBk.deductionActive === false &&
+    Object.values(keptBk.yearly).reduce((a, b) => a + b, 0) === 200,
+    '保留记录仍展示名义扣减量，deductionActive=false');
+
+  // ---- 调整核对：未开始计划的停灯必须落在拟改新窗内；新残余继续扣停灯 ----
+  const exAdjBk = await createExhibit('停灯调整展品');
+  await call('POST', `/api/exhibits/${exAdjBk}/limits`, { year: 2035, limitLxh: 100000 }, 'c');
+  await call('POST', `/api/exhibits/${exAdjBk}/limits`, { year: 2036, limitLxh: 100000 }, 'c');
+  const abPlan = await submitPlan(exAdjBk, '调整停灯计划', '2035-06-01', '2035-06-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(abPlan);
+  // 直接在库中写入一条停灯（2035-06-01 10:00-12:00，已批准未开始计划）
+  await dbModule.withTransaction(async (client) => {
+    const exRow = await client.query('SELECT exhibit_id FROM plans WHERE id = $1', [abPlan]);
+    await client.query(
+      `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [abPlan, exRow.rows[0].exhibit_id,
+        new Date(dosing2.wallToTs('2035-06-01', 600)),
+        new Date(dosing2.wallToTs('2035-06-01', 720)),
+        'SQL 预置停灯']
+    );
+  });
+  r = await call('GET', `/api/exhibits/${exAdjBk}`, null, 'c');
+  const adjBkSrc = r.body.sources.find((s) => s.kind === 'plan' && s.id === abPlan);
+  assert(adjBkSrc.yearly['2035'] === 600, '未开始计划停灯 200 已从估算残余扣除（800→600）');
+
+  // 同窗口调整（照度改为 200）：新残余 = (8-2)h*200 = 1200
+  r = await call('POST', '/api/adjustments', {
+    planId: abPlan, startDate: '2035-06-01', endDate: '2035-06-01',
+    periods: ['09:00-17:00'], estimatedLux: 200,
+  }, 'i');
+  assert(r.status === 201, '提交同窗口照度调整');
+  const abAdj = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.newResidueYearly['2035'] === 1200,
+    '调整试算新残余继续扣除停灯（6h*200=1200）');
+  assert(r.body.adjustment.preview.oldResidueYearly['2035'] === 600,
+    '调整试算原残余口径含停灯扣减（600）');
+
+  // 拟改新窗不覆盖该停灯（2035-06-02）：outsideBlackouts 冲突
+  await call('POST', `/api/adjustments/${abAdj}/withdraw`, {}, 'i');
+  r = await call('POST', '/api/adjustments', {
+    planId: abPlan, startDate: '2035-06-02', endDate: '2035-06-02',
+    periods: ['09:00-17:00'], estimatedLux: 100,
+  }, 'i');
+  assert(r.status === 201, '提交排除停灯窗口的调整申请');
+  const abAdj2 = r.body.adjustment.id;
+  assert(r.body.adjustment.preview.conflicts.outsideBlackouts.some((x) => /SQL 预置停灯/.test(x.reason)),
+    '试算指出停灯落在新开灯窗外');
+  r = await call('POST', `/api/adjustments/${abAdj2}/approve`, {}, 'c');
+  assert(r.status === 409 && /停灯记录/.test(r.body.error), '窗外停灯的调整批准被拒（409）');
+  assert(r.body.details.conflicts.outsideBlackouts.length === 1,
+    '结构化明细给出窗外停灯');
+  await call('POST', `/api/adjustments/${abAdj2}/withdraw`, {}, 'i');
+
+  // ---- 上限下调预演指纹包含停灯：预演后新增停灯，旧凭证提交被拒 ----
+  const exBkLim = await createExhibit('停灯预演展品');
+  await call('POST', `/api/exhibits/${exBkLim}/limits`, { year: 2036, limitLxh: 10000 }, 'c');
+  const lbPlan = await submitPlan(exBkLim, '预演停灯计划', '2036-05-01', '2036-05-01',
+    ['09:00-17:00'], 100); // 800
+  await approvePlan(lbPlan);
+  // 预置停灯 2h（200），used=600
+  await dbModule.withTransaction(async (client) => {
+    const exRow = await client.query('SELECT exhibit_id FROM plans WHERE id = $1', [lbPlan]);
+    await client.query(
+      `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [lbPlan, exRow.rows[0].exhibit_id,
+        new Date(dosing2.wallToTs('2036-05-01', 540)),
+        new Date(dosing2.wallToTs('2036-05-01', 660)),
+        '预演前停灯']
+    );
+  });
+  r = await call('POST', `/api/exhibits/${exBkLim}/limits/preview`,
+    { year: 2036, limitLxh: 700 }, 'c');
+  assert(r.status === 200, '停灯预演成功');
+  assert(r.body.preview.used === 600, '预演占用含停灯扣减（估算残余 600）');
+  assert(r.body.preview.blackoutDeductions.some((x) => x.yearDeduction === 200 && x.planId === lbPlan),
+    '预演列出该年停灯扣减量 200');
+  const staleBkToken = r.body.preview.token;
+  // 预演后再插入一条停灯（13:00-14:00，100），used 降到 500
+  await dbModule.withTransaction(async (client) => {
+    const exRow = await client.query('SELECT exhibit_id FROM plans WHERE id = $1', [lbPlan]);
+    await client.query(
+      `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [lbPlan, exRow.rows[0].exhibit_id,
+        new Date(dosing2.wallToTs('2036-05-01', 780)),
+        new Date(dosing2.wallToTs('2036-05-01', 840)),
+        '预演后停灯']
+    );
+  });
+  r = await call('POST', `/api/exhibits/${exBkLim}/limits/lower`,
+    { year: 2036, limitLxh: 700, token: staleBkToken }, 'c');
+  assert(r.status === 409 && /已变化/.test(r.body.error), '新增停灯后旧预演凭证被拒（占用已变化）');
+  assert(r.body.details.preview.used === 500,
+    `最新预演反映停灯扣减后 used=500，实际 ${r.body.details.preview.used}`);
+
+  // 操作流水：停灯登记
+  r = await call('GET', '/api/audit?limit=1000', null, 'c');
+  assert(r.body.events.some((e) => e.action === 'blackout.create'),
+    '操作流水记录了停灯登记');
+
   // ---- 操作流水存在 ----
   r = await call('GET', '/api/audit?limit=1000', null, 'c');
   assert(r.status === 200 && r.body.events.some((e) => e.action === 'plan.approve'),

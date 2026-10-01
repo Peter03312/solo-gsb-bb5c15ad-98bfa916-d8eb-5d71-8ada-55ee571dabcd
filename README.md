@@ -50,6 +50,18 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       **未被已确认实测覆盖部分**的估算残余**同时替换**两份旧残余，超额时列出**年份、各计划贡献与超额量**。
     - 提交在**展品锁事务内重新核对**，全部通过才**原子更新两条计划、结案两份申请并记审计**；
       任一失败则事务回滚，**两份申请仍待审、计划与额度不变**。
+13. **停灯登记（blackout）**：保管员可对**已批准或待复核**计划登记**已发生**的停灯时段（原因必填）。
+    - 起点须早于终点、**结束不得晚于当前时间**；时段必须**完整落在该计划开灯窗内**；
+      不得与同展品**未作废实测（含待确认草稿）**或**其他停灯记录**相交。失败一次性指出全部冲突
+      （409，`details.overlappingMeasurements` / `details.overlappingBlackouts`），**不保存**。
+    - **停灯记录永久保留，不可修改、不可删除**；计划取消/调整后记录仍在；**布展员只读**。
+    - **扣减口径全系统一致**：停灯只从所属计划**未被已确认实测覆盖**的估算时段中扣减
+      （按计划预计照度 × 停灯时长，跨年按自然年拆分）；**不减已确认实测**，
+      **也不释放原计划的排期占用**（计划开灯窗与计划间重叠判定不变）。
+    - 展品年度占用及来源、计划批准与复核、调整试算与核准、上限下调预演均使用**同一扣减口径**
+      （估算残余 = 开灯窗 − 已确认实测覆盖 − 本计划停灯）；调整/成对核准还要求**既有停灯仍落在拟改新窗内**。
+    - 后续实测**录入或确认碰到停灯时段一律拒绝**。展品详情展示全部停灯记录及**各年扣减量**，
+      既有查询字段保持兼容（仅附加新字段）。
 
 ## 一键启动（Docker Compose）
 
@@ -135,8 +147,12 @@ npm run test:utils
    确认后在预演结果中点「提交下调」。若预演后占用被他人改动，提交会被拒绝并自动展示最新预演结果。
    已开始计划不会被转状态，剩余超额继续在额度表中红色显示，待复核计划由保管员复核（沿用既有重叠/额度校验）。
 8. 「操作流水」保留全部审批、调整、确认、上限下调、状态变更等记录。
+9. 展期内发生临时关灯（设备检修、撤展避险等）时，保管员在展品详情「停灯记录」处选择已批准/待复核计划、
+   填写已发生的起止时刻与**必填原因**后登记：系统校验起止顺序、结束不晚于当前、完整落在开灯窗内、
+   不与未作废实测或其他停灯相交；通过后该时段按计划预计照度从估算中按自然年扣减（不减已确认实测、
+   不释放排期）。停灯记录保留、不可改删，布展员只读；之后录入/确认碰到该时段的实测会被拒绝。
 
-## HTTP API（含计划调整申请、成对核准、年度上限下调预演）
+## HTTP API（含计划调整申请、成对核准、年度上限下调预演、停灯登记）
 
 所有接口除 `/api/health`、`/api/auth/login` 外都需要登录会话（HttpOnly Cookie `lqsession`）。
 统一错误形态：`{ "error": "中文原因", "details": { ... } }`，409 用于冲突（重叠/超额/重复申请）。
@@ -159,7 +175,7 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
-| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测 |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总 |
 | `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限；**若为下调，同事务即时重算并把超额年未开始计划转待复核**（成功响应仍为展品详情，另附 `overflows`/`flaggedPlans`） |
 | `POST /api/exhibits/:id/limits/preview` | 保管员 | **下调预演**：不改状态，返回凭证与该年实测/各计划估算残余/预计超额/将转复核的计划 |
 | `POST /api/exhibits/:id/limits/lower` | 保管员 | **携预演凭证提交下调**；占用已变化返回 409 + 最新结果与新凭证 |
@@ -170,7 +186,9 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `POST /api/plans/:id/reject` | 保管员 | 驳回落计划 |
 | `POST /api/plans/:id/cancel` | 登录 | 取消（布展员仅自己未批准的；保管员均可） |
 | `GET/POST /api/measurements`、`POST /api/measurements/:id/confirm`、`DELETE /api/measurements/:id` | 保管员 | 实测录入/确认/删草稿 |
-| `GET /api/audit` | 保管员 | 操作流水 |
+| `GET /api/blackouts?exhibitId=&planId=` | 登录 | 停灯记录列表（布展员只读），逐条附 `yearly` 按年扣减量；另返回 `blackoutDeductionByExhibit` |
+| `POST /api/blackouts` | 保管员 | 登记已发生停灯时段；成功响应为展品详情（另附 `blackout`）；冲突 409 不保存 |
+| `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`） |
 
 ### 计划调整申请 `/api/adjustments`
 
@@ -422,6 +440,86 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/1/limit
 成功响应仍是展品详情（兼容），另附 `overflows` 与 `flaggedPlans`；不超额/上调/首次登记时两者为空、
 `limitLowered` 为 `null`。
 
+### 停灯登记 `/api/blackouts`
+
+保管员对**已批准或待复核**计划登记**已发生**的停灯时段（`reason` 必填）。布展员仅有只读权限；
+记录一经保存**不可修改/删除**（`PUT/DELETE /api/blackouts/:id` 返回 400）。
+
+登记校验：起点早于终点、结束不晚于当前时间、完整落在计划开灯窗内；不与同展品未作废实测
+（含待确认草稿）或其他停灯记录相交。时间/窗口/原因为 400；相交冲突为 **409**，一次性指出全部冲突且不保存。
+
+请求体（起止可跨日，墙上时间，与实测接口同形）：
+
+```json
+{
+  "planId": 7,
+  "startDate": "2032-06-01",
+  "startTime": "10:00",
+  "endDate": "2032-06-01",
+  "endTime": "12:00",
+  "reason": "灯具故障临时关灯检修"
+}
+```
+
+curl 示例（保管员 Cookie 存于 cookies-custodian.txt）：
+
+```bash
+# 1) 保管员登记停灯（成功响应 = 更新后的展品详情，另附本次 blackout）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/blackouts \
+  -H 'Content-Type: application/json' \
+  -d '{"planId":7,"startDate":"2032-06-01","startTime":"10:00",
+       "endDate":"2032-06-01","endTime":"12:00","reason":"灯具故障临时关灯检修"}'
+
+# 2) 布展员（或保管员）只读查询停灯记录及各年扣减量
+curl -b cookies.txt 'http://localhost:3000/api/blackouts?exhibitId=3'
+curl -b cookies.txt 'http://localhost:3000/api/blackouts?planId=7'
+
+# 3) 布展员登记 -> 403；修改/删除 -> 400（停灯记录保留）
+curl -b cookies.txt -X DELETE http://localhost:3000/api/blackouts/1
+# {"error":"停灯记录保留，不可删除"}
+```
+
+成功响应中的停灯对象（展品详情顶层 `blackouts` 为全部记录、`blackoutDeductionYearly` 为各年扣减汇总）：
+
+```json
+{
+  "id": 1,
+  "planId": 7,
+  "exhibitId": 3,
+  "planTitle": "未来计划1",
+  "planStatus": "approved",
+  "start": "2032-06-01 10:00",
+  "end": "2032-06-01 12:00",
+  "reason": "灯具故障临时关灯检修",
+  "creatorName": "保管员（默认）",
+  "yearly": { "2032": 200 },
+  "deductionActive": true
+}
+```
+
+`yearly` 是该停灯从所属计划**估算**中扣减的按年剂量（计划预计照度 × 窗内停灯时长，按自然年拆分；
+已被已确认实测覆盖的部分不重复扣）。所属计划已取消/驳回时记录仍列出，`deductionActive` 为 `false`，
+`yearly` 为按当前计划窗计算的名义扣减量，不计入年度占用。
+
+登记冲突（409）响应示例：
+
+```json
+{
+  "error": "停灯登记失败：与待确认实测 #31（2032-06-01 10:00 ~ 2032-06-01 11:00）相交；与停灯记录 #2（计划「夜场」，2032-06-01 11:30 ~ 2032-06-01 12:30）相交，未保存",
+  "details": {
+    "overlappingMeasurements": [
+      { "id": 31, "planId": 7, "status": "draft", "start": "2032-06-01 10:00", "end": "2032-06-01 11:00" }
+    ],
+    "overlappingBlackouts": [
+      { "id": 2, "planId": 7, "planTitle": "夜场", "start": "2032-06-01 11:30", "end": "2032-06-01 12:30" }
+    ]
+  }
+}
+```
+
+后续对停灯时段录入/确认实测同样被拒（409，`details.overlappingBlackoutId`）。
+调整申请/成对核准试算的 `conflicts.outsideBlackouts` 会列出落在拟改新窗之外的既有停灯。
+
 
 
 ```
@@ -437,8 +535,8 @@ src/
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
   validation.js    中文输入校验（时段/日期/正数等）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
-  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、下调上限预演核算
-  routes/          auth/users/exhibits/plans/adjustments/measurements/audit 路由
+  service.js       额度占用计算、批准校验、实测窗口校验、待复核筛选、调整申请试算/核对（含成对核准）、下调上限预演核算、停灯登记校验与按年扣减
+  routes/          auth/users/exhibits/plans/adjustments/measurements/blackouts/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
 Dockerfile / docker-compose.yml

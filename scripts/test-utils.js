@@ -83,4 +83,42 @@ test('包含判断：严格在内/越界', () => {
   assert.strictEqual(dosing.containsInterval(outer, { start: 150, end: 201 }), false);
 });
 
+// 6) 停灯区间与开灯窗求交（clipIntervalToWindows）
+test('停灯区间完整落在单个开灯窗内时交集即自身', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01', parsePeriods(['09:00-17:00']));
+  const hole = { start: dosing.wallToTs('2026-03-01', 10 * 60), end: dosing.wallToTs('2026-03-01', 12 * 60) };
+  const parts = dosing.clipIntervalToWindows(hole, wins);
+  assert.strictEqual(parts.length, 1);
+  assert.strictEqual(parts[0].start, hole.start);
+  assert.strictEqual(parts[0].end, hole.end);
+});
+
+test('停灯区间横跨午间两段开灯窗时只保留窗内部分（两段）', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01',
+    parsePeriods(['09:00-12:00', '13:00-17:00']));
+  const hole = { start: dosing.wallToTs('2026-03-01', 11 * 60), end: dosing.wallToTs('2026-03-01', 14 * 60) };
+  const parts = dosing.clipIntervalToWindows(hole, wins);
+  assert.strictEqual(parts.length, 2);
+  const mins = parts.reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  // 11-12（1h）+ 13-14（1h）= 2h，午间关灯 1h 不计
+  assert.strictEqual(mins, 120);
+});
+
+test('停灯区间完全在开灯窗外时交集为空', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01', parsePeriods(['09:00-17:00']));
+  const hole = { start: dosing.wallToTs('2026-03-01', 18 * 60), end: dosing.wallToTs('2026-03-01', 20 * 60) };
+  assert.strictEqual(dosing.clipIntervalToWindows(hole, wins).length, 0);
+});
+
+test('停灯有效扣减 = 落在窗内部分再扣已确认实测覆盖（只扣估算）', () => {
+  const wins = dosing.buildWindows('2026-03-01', '2026-03-01', parsePeriods(['09:00-17:00']));
+  const hole = { start: dosing.wallToTs('2026-03-01', 10 * 60), end: dosing.wallToTs('2026-03-01', 13 * 60) };
+  const clipped = dosing.clipIntervalToWindows(hole, wins);
+  // 已确认实测覆盖 11:00-12:00（该部分由实测计量，不再作为停灯扣减）
+  const measured = [{ start: dosing.wallToTs('2026-03-01', 11 * 60), end: dosing.wallToTs('2026-03-01', 12 * 60) }];
+  const effective = dosing.subtractIntervals(clipped, measured);
+  const mins = effective.reduce((s, p) => s + (p.end - p.start) / 60000, 0);
+  assert.strictEqual(mins, 120); // 10-11 与 12-13，共 2h
+});
+
 console.log(`\n全部 ${passed} 项算法测试通过。`);

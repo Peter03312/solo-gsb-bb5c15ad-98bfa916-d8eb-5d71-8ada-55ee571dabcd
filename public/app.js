@@ -212,13 +212,14 @@ function renderDetail() {
     return `<div class="source-item plan ${s.status}">
       估算残余 · 计划 #${s.id}「${esc(s.title)}」${badge(s.status)}
       ：${esc(s.startDate)} ~ ${esc(s.endDate)}，每日 ${(s.periods || []).map(esc).join('、')}，${s.lux} lx
-      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖部分）</div></div>`;
+      <div class="source-doses">占用额度：${yearlyText(s.yearly)}（已扣除被实测覆盖与停灯部分）</div></div>`;
   }).join('') || '<p class="muted">暂无占用</p>';
 
   $('#detail-plan-tbody').innerHTML = d.plans.map(planRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无计划</td></tr>';
   $('#detail-meas-tbody').innerHTML = d.measurements.map(measRow).join('') ||
     '<tr><td colspan="7" class="muted">暂无实测</td></tr>';
+  renderBlackouts(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
@@ -226,6 +227,70 @@ function renderDetail() {
   $$('.adj-open').forEach((btn) => btn.addEventListener('click', () => openAdjustmentForm(Number(btn.dataset.id))));
   renderPairBox();
 }
+
+/** 渲染停灯记录与各年扣减量，并填充登记表单的计划下拉（仅已批准/待复核）。 */
+function renderBlackouts(d) {
+  const tbody = $('#detail-blackout-tbody');
+  if (!tbody) return;
+  const blackouts = d.blackouts || [];
+  tbody.innerHTML = blackouts.length ? blackouts.map((b) => {
+    const inactive = b.deductionActive === false;
+    return `<tr${inactive ? ' class="over-row"' : ''}>
+      <td>${b.id}</td>
+      <td>#${b.planId} ${esc(b.planTitle || '')}
+        ${b.planStatus ? `<div class="small muted">${badge(b.planStatus)}</div>` : ''}
+        ${inactive ? '<div class="small muted">计划已不占用，记录保留（名义扣减量）</div>' : ''}</td>
+      <td>${esc(b.start)}</td><td>${esc(b.end)}</td>
+      <td>${esc(b.reason)}</td>
+      <td class="mono">${yearlyText(b.yearly)}</td>
+      <td class="small">${esc(b.creatorName || '—')}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="muted">暂无停灯记录</td></tr>';
+
+  const sel = $('#blackout-plan-select');
+  if (sel) {
+    const active = (d.plans || []).filter((p) => ['approved', 'pending_review'].includes(p.status));
+    sel.innerHTML = active.length
+      ? active.map((p) => `<option value="${p.id}">#${p.id} ${esc(p.title)}（${ymdText(p.start_date)}~${ymdText(p.end_date)}）</option>`).join('')
+      : '<option value="">（暂无已批准/待复核计划）</option>';
+  }
+}
+
+$('#blackout-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  const planId = Number(fd.get('planId'));
+  if (!planId) { flash('error', '请选择已批准或待复核计划'); return; }
+  try {
+    const detail = await api('POST', '/api/blackouts', {
+      planId,
+      startDate: fd.get('startDate'),
+      startTime: fd.get('startTime'),
+      endDate: fd.get('endDate') || fd.get('startDate'),
+      endTime: fd.get('endTime'),
+      reason: fd.get('reason'),
+    });
+    state.detail = detail;
+    e.target.reset();
+    renderDetail();
+    const ded = Object.entries(detail.blackout.yearly || {})
+      .map(([y, v]) => `${y} 年 ${fmtN(v)} lx·h`).join('，');
+    flash('success', `停灯已登记并从估算中扣减（${ded}）；记录保留、不可改删`);
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.details) {
+      const det = err.data.details;
+      const items = [];
+      (det.overlappingMeasurements || []).forEach((m) =>
+        items.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${esc(m.start)} ~ ${esc(m.end)}）相交`));
+      (det.overlappingBlackouts || []).forEach((b) =>
+        items.push(`与停灯记录 #${b.id}（${esc(b.start)} ~ ${esc(b.end)}）相交`));
+      flash('error', err.message, items.length ? '<ul>' + items.map((x) => `<li>${x}</li>`).join('') + '</ul>' : '');
+    } else {
+      flash('error', err.message);
+    }
+  }
+});
 
 function planRow(p) {
   return `<tr>

@@ -17,6 +17,7 @@ const {
   intersects,
   containsInterval,
   anyIntersect,
+  clipIntervalToWindows,
   round3,
   wallToTs,
   tsToWallString,
@@ -92,17 +93,136 @@ function normalizePeriods(value) {
 }
 
 /**
- * 计划在扣除已确认实测覆盖后的估算剂量（按年）。
- * measWindows: computeOccupancy 中构造的实测区间数组。
+ * 读取展品的全部停灯记录（永久保留，计划已取消/驳回也带出），附计划字段供按窗计算。
+ * 仅 planId 过滤时返回该计划的停灯（用于调整核对窗外判定）。
+ * 注意：拆成多条简单查询而非 JOIN —— 个别内存驱动（pg-mem）对多表 JOIN 的实现有缺陷。
  */
-function planResidueYearly(plan, measWindows) {
-  const windows = planWindows(plan);
-  const coverers = measWindows.filter((mw) => windows.some((w) => intersects(w, mw)));
-  const remaining = subtractIntervals(windows, coverers);
-  return yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
+async function getBlackoutRows(client, exhibitId, { planId = null } = {}) {
+  const { rows } = await client.query(
+    `SELECT * FROM blackouts
+      WHERE exhibit_id = $1
+        AND ($2::bigint IS NULL OR plan_id = $2)
+      ORDER BY start_ts, id`,
+    [exhibitId, planId]
+  );
+  if (rows.length === 0) return rows;
+  const planIds = [...new Set(rows.map((r) => Number(r.plan_id)))];
+  const placeholders = planIds.map((_, i) => `$${i + 1}`).join(',');
+  const { rows: planRows } = await client.query(
+    `SELECT id, title, status, start_date, end_date, light_periods, estimated_lux
+       FROM plans WHERE id IN (${placeholders})`,
+    planIds
+  );
+  const planById = new Map(planRows.map((p) => [Number(p.id), p]));
+  const userIds = [...new Set(rows.map((r) => r.created_by).filter(Boolean))];
+  const userMap = new Map();
+  if (userIds.length > 0) {
+    const uph = userIds.map((_, i) => `$${i + 1}`).join(',');
+    const { rows: userRows } = await client.query(
+      `SELECT id, display_name FROM users WHERE id IN (${uph})`,
+      userIds
+    );
+    for (const u of userRows) userMap.set(Number(u.id), u.display_name);
+  }
+  return rows.map((row) => {
+    const p = planById.get(Number(row.plan_id));
+    return {
+      ...row,
+      plan_title: p ? p.title : null,
+      plan_status: p ? p.status : null,
+      plan_start_date: p ? p.start_date : null,
+      plan_end_date: p ? p.end_date : null,
+      plan_light_periods: p ? p.light_periods : null,
+      plan_estimated_lux: p ? p.estimated_lux : null,
+      creator_name: row.created_by ? userMap.get(Number(row.created_by)) || null : null,
+    };
+  });
 }
 
-/** 区间重叠的已确认实测（同一展品，排除作废），含端点比较。 */
+/**
+ * 一条停灯记录“从估算中实际扣减”的有效时间窗：
+ *   停灯区间 ∩ 所属计划开灯窗 − 同展品全部已确认实测覆盖。
+ * 口径：停灯只从所属计划未被已确认实测覆盖的估算时段扣除；与实测相交的部分（业务上互斥，
+ * 此处为防御性处理）不扣估算（该部分由实测计量）。
+ */
+function effectiveBlackoutWindows(row, planWindowsById, confirmedWindows) {
+  const windows = planWindowsById.get(Number(row.plan_id)) || [];
+  const clipped = clipIntervalToWindows(
+    { start: new Date(row.start_ts).getTime(), end: new Date(row.end_ts).getTime() },
+    windows
+  );
+  return subtractIntervals(clipped, confirmedWindows);
+}
+
+/**
+ * 构造展品停灯视图：每条记录附按年扣减量（按其所属计划预计照度，按自然年拆分）。
+ * 返回 { items, windowsByPlan: Map<planId, [{start,end}有效扣减窗]>,
+ *        totalDeductionYearly: {year: dose} }
+ *
+ * 口径说明：
+ *  - 停灯记录永久保留；所属计划已不再占用（取消/驳回）时，记录照常列出并给出“若按当前计划窗
+    *    计算的名义扣减量”，但 isActive=false 且不计入 totalDeductionYearly（computeOccupancy 本就
+    *    不含这些计划的估算残余）。
+ *  - confirmedRows: 该展品已确认实测行（默认自行查询）。
+ */
+async function loadBlackoutView(client, exhibitId, { confirmedRows = null } = {}) {
+  const rows = await getBlackoutRows(client, exhibitId);
+  const activePlans = await getOccupyingPlans(client, exhibitId);
+  const activeIds = new Set(activePlans.map((p) => Number(p.id)));
+  const measurements = confirmedRows || (await getActiveMeasurements(client, exhibitId));
+  const confirmedWindows = measurements.map((m) => ({
+    start: new Date(m.start_ts).getTime(),
+    end: new Date(m.end_ts).getTime(),
+  }));
+
+  // 以记录联表的计划字段构造计划窗（含已取消计划，便于给出名义扣减量）
+  const planWindowsById = new Map();
+  const planLuxById = new Map();
+  for (const row of rows) {
+    const pid = Number(row.plan_id);
+    if (!planWindowsById.has(pid)) {
+      planWindowsById.set(pid, buildWindows(
+        dateYmd(row.plan_start_date),
+        dateYmd(row.plan_end_date),
+        parsePeriods(normalizePeriods(row.plan_light_periods))
+      ));
+      planLuxById.set(pid, Number(row.plan_estimated_lux));
+    }
+  }
+
+  const windowsByPlan = new Map();
+  const totalDeductionYearly = {};
+  const items = rows.map((row) => {
+    const pid = Number(row.plan_id);
+    const eff = effectiveBlackoutWindows(row, planWindowsById, confirmedWindows);
+    const yearly = yearMapToObject(doseByYear(eff, planLuxById.get(pid)));
+    const isActive = activeIds.has(pid);
+    if (isActive) {
+      if (!windowsByPlan.has(pid)) windowsByPlan.set(pid, []);
+      windowsByPlan.get(pid).push(...eff);
+      addYearDose(totalDeductionYearly, yearly);
+    }
+    return {
+      id: row.id,
+      planId: pid,
+      exhibitId: Number(row.exhibit_id),
+      planTitle: row.plan_title,
+      planStatus: row.plan_status,
+      start: tsToWallString(new Date(row.start_ts).getTime()),
+      end: tsToWallString(new Date(row.end_ts).getTime()),
+      reason: row.reason,
+      createdBy: row.created_by,
+      creatorName: row.creator_name || null,
+      createdAt: row.created_at,
+      yearly,
+      deductionActive: isActive,
+    };
+  });
+
+  return { items, windowsByPlan, totalDeductionYearly };
+}
+
+/** 取同展品与给定区间相交的未作废实测（含待确认草稿），排除 excludeId。 */
 async function findOverlappingMeasurement(client, exhibitId, startMs, endMs, excludeId = null) {
   const { rows } = await client.query(
     `SELECT id, start_ts, end_ts FROM measurements
@@ -116,13 +236,40 @@ async function findOverlappingMeasurement(client, exhibitId, startMs, endMs, exc
   return rows[0] || null;
 }
 
+/** 取同展品与给定区间相交的其他停灯记录（停灯永久保留，无作废状态），排除 excludeId。 */
+async function findOverlappingBlackout(client, exhibitId, startMs, endMs, excludeId = null) {
+  // 不使用 JOIN：个别内存驱动（pg-mem）对 JOIN + 时间不等式组合的实现有缺陷
+  const { rows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts FROM blackouts
+      WHERE exhibit_id = $1
+        AND ($4::bigint IS NULL OR id <> $4)
+        AND start_ts < $3 AND end_ts > $2
+      ORDER BY id
+      LIMIT 1`,
+    [exhibitId, new Date(startMs), new Date(endMs), excludeId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * 计划在扣除“已确认实测覆盖 + 本计划停灯”后的估算剂量（按年）。
+ * 统一扣减口径：批准/复核、占用查询、调整试算/成对核准、上限下调预演均经此或同构逻辑。
+ */
+function planResidueYearly(plan, measWindows, blackoutWindowsByPlan) {
+  const windows = planWindows(plan);
+  const coverers = measWindows.filter((mw) => windows.some((w) => intersects(w, mw)));
+  const blackouts = (blackoutWindowsByPlan && blackoutWindowsByPlan.get(Number(plan.id))) || [];
+  const remaining = subtractIntervals(windows, [...coverers, ...blackouts]);
+  return yearMapToObject(doseByYear(remaining, Number(plan.estimated_lux)));
+}
+
 /**
  * 计算一件展品的年度额度占用。
  * 口径：
  *   used[year] = Σ 已确认实测剂量（按时窗自然年拆分）
- *              + Σ 已批准/待复核计划“未被已确认实测覆盖部分”的估算剂量
- * 同一计划窗口先被该展品全部已确认实测（通常即本计划的实测）扣除，再按其照度估算，
- * 因此实测确认后该时段自动以实测替代估算。
+ *              + Σ 已批准/待复核计划“未被已确认实测覆盖、且扣除本计划停灯后”的估算剂量
+ * 同一计划窗口先被该展品全部已确认实测（通常即本计划的实测）与本计划停灯扣除，再按其照度估算，
+ * 因此实测确认后该时段自动以实测替代估算；停灯时段自动从估算中扣减（不扣实测、不释放排期）。
  */
 async function computeOccupancy(client, exhibitId, { excludePlanId = null, extraMeasurement = null } = {}) {
   const plans = await getOccupyingPlans(client, exhibitId, excludePlanId);
@@ -153,10 +300,13 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     });
   }
 
+  // 停灯视图：记录列表（附按年扣减量）+ 按计划分组的“有效扣减窗”（仅占用中的计划计入）
+  const blackoutView = await loadBlackoutView(client, exhibitId, { confirmedRows: measurements });
+
   const used = {};
   const sources = [];
 
-  // 1) 实测部分
+  // 1) 实测部分（停灯不减实测）
   for (const mw of measWindows) {
     const yearly = yearMapToObject(doseByYear([{ start: mw.start, end: mw.end }], mw.lux));
     addYearDose(used, yearly);
@@ -171,9 +321,9 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     });
   }
 
-  // 2) 计划的估算残余
+  // 2) 计划的估算残余（开灯窗 − 已确认实测覆盖 − 本计划停灯）
   for (const plan of plans) {
-    const yearly = planResidueYearly(plan, measWindows);
+    const yearly = planResidueYearly(plan, measWindows, blackoutView.windowsByPlan);
     addYearDose(used, yearly);
     sources.push({
       kind: 'plan',
@@ -206,7 +356,16 @@ async function computeOccupancy(client, exhibitId, { excludePlanId = null, extra
     };
   }
 
-  return { limits, used, years, sources, plans, measurements };
+  return {
+    limits,
+    used,
+    years,
+    sources,
+    plans,
+    measurements,
+    blackouts: blackoutView.items,
+    blackoutDeductionYearly: blackoutView.totalDeductionYearly,
+  };
 }
 
 /** 检查新增/复核的年度剂量并入当前占用后是否超限，返回超额明细数组。 */
@@ -243,6 +402,7 @@ function planOverlaps(targetWindows, otherPlan) {
  * 校验实测时段：
  *  - 必须落在所属已批准/待复核计划的开灯窗内
  *  - 不得与同展品任何未作废实测重叠
+ *  - 不得与同展品任何停灯记录相交（停灯与实测互斥，录入或确认都拒绝）
  * 返回 { start, end, windows }（毫秒）
  */
 async function validateMeasurementWindow(client, plan, startYmd, startMinute, endYmd, endMinute, excludeMeasId = null) {
@@ -268,7 +428,116 @@ async function validateMeasurementWindow(client, plan, startYmd, startMinute, en
       { overlappingMeasurementId: overlap.id }
     );
   }
+  const blackoutClash = await findOverlappingBlackout(client, plan.exhibit_id, start, end);
+  if (blackoutClash) {
+    throw new ConflictError(
+      `实测时段与停灯记录 #${blackoutClash.id}（计划 #${blackoutClash.plan_id}，` +
+        `${tsToWallString(new Date(blackoutClash.start_ts).getTime())} ~ ` +
+        `${tsToWallString(new Date(blackoutClash.end_ts).getTime())}）相交，已拒绝；` +
+        '停灯时段不可录入实测，停灯记录亦不可修改/删除',
+      { overlappingBlackoutId: blackoutClash.id, overlappingBlackoutPlanId: blackoutClash.plan_id }
+    );
+  }
   return { start, end, windows };
+}
+
+/**
+ * 校验并登记停灯时段（由路由在展品锁事务内调用）：
+ *  - 计划必须为已批准或待复核
+ *  - 起点须早于终点；结束不得晚于当前时间（只登记已发生时段）
+ *  - 时段必须完整落在该计划当前开灯窗内
+ *  - 不得与同展品未作废实测（含待确认草稿）相交
+ *  - 不得与同展品其他停灯记录相交
+ *  - 原因必填
+ * 全部失败一次性收集：窗口/时间类错误抛 400；冲突类抛 409 并在 details 中指出全部冲突，不保存。
+ * 返回插入的停灯行。
+ */
+async function registerBlackout(client, { planId, startMs, endMs, reason }, actor) {
+  const plan = await getPlan(client, planId);
+  if (!ACTIVE_PLAN_STATUSES.includes(plan.status)) {
+    throw new ValidationError(
+      `只有已批准或待复核计划才能登记停灯（当前状态：${plan.status}）`
+    );
+  }
+  if (!(endMs > startMs)) throw new ValidationError('停灯时段起点须早于终点');
+  const nowMs = Date.now();
+  if (endMs > nowMs) {
+    throw new ValidationError(
+      `停灯结束时刻（${tsToWallString(endMs)}）晚于当前时间，只能登记已发生的停灯时段`
+    );
+  }
+  const reasonText = nonEmptyString(reason, '停灯原因', 1000);
+
+  const windows = planWindows(plan);
+  const seg = { start: startMs, end: endMs };
+  if (!windows.some((w) => containsInterval(w, seg))) {
+    throw new ValidationError(
+      `停灯时段 ${tsToWallString(startMs)} ~ ${tsToWallString(endMs)} ` +
+        '没有完整落在该计划的开灯窗内'
+    );
+  }
+
+  // 冲突一次性收集：未作废实测（含草稿）与其他停灯记录
+  const { rows: measRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts, status
+       FROM measurements
+      WHERE exhibit_id = $1 AND status <> 'annulled'
+        AND start_ts < $3 AND end_ts > $2
+      ORDER BY id`,
+    [plan.exhibit_id, new Date(startMs), new Date(endMs)]
+  );
+  const { rows: blackoutRows } = await client.query(
+    `SELECT id, plan_id, start_ts, end_ts FROM blackouts
+      WHERE exhibit_id = $1
+        AND start_ts < $3 AND end_ts > $2
+      ORDER BY id`,
+    [plan.exhibit_id, new Date(startMs), new Date(endMs)]
+  );
+  if (measRows.length > 0 || blackoutRows.length > 0) {
+    // 计划标题单独批量查（避免 JOIN + 时间不等式在个别内存驱动上的实现问题）
+    const planIds = [...new Set(blackoutRows.map((b) => Number(b.plan_id)))];
+    const titleMap = new Map();
+    if (planIds.length > 0) {
+      const placeholders = planIds.map((_, i) => `$${i + 1}`).join(',');
+      const tRows = await client.query(
+        `SELECT id, title FROM plans WHERE id IN (${placeholders})`,
+        planIds
+      );
+      for (const t of tRows.rows) titleMap.set(Number(t.id), t.title);
+    }
+    const overlappingMeasurements = measRows.map((m) => ({
+      id: m.id,
+      planId: m.plan_id,
+      status: m.status,
+      start: tsToWallString(new Date(m.start_ts).getTime()),
+      end: tsToWallString(new Date(m.end_ts).getTime()),
+    }));
+    const overlappingBlackouts = blackoutRows.map((b) => ({
+      id: b.id,
+      planId: b.plan_id,
+      planTitle: titleMap.get(Number(b.plan_id)) || null,
+      start: tsToWallString(new Date(b.start_ts).getTime()),
+      end: tsToWallString(new Date(b.end_ts).getTime()),
+    }));
+    const parts = [];
+    for (const m of overlappingMeasurements) {
+      parts.push(`与${m.status === 'draft' ? '待确认' : '已确认'}实测 #${m.id}（${m.start} ~ ${m.end}）相交`);
+    }
+    for (const b of overlappingBlackouts) {
+      parts.push(`与停灯记录 #${b.id}（计划「${b.planTitle}」，${b.start} ~ ${b.end}）相交`);
+    }
+    throw new ConflictError(`停灯登记失败：${parts.join('；')}，未保存`, {
+      overlappingMeasurements,
+      overlappingBlackouts,
+    });
+  }
+
+  const inserted = await client.query(
+    `INSERT INTO blackouts (plan_id, exhibit_id, start_ts, end_ts, reason, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [planId, plan.exhibit_id, new Date(startMs), new Date(endMs), reasonText, actor.userId]
+  );
+  return inserted.rows[0];
 }
 
 /**
@@ -413,6 +682,7 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
     notApproved: plan.status !== 'approved',
     notStarted: !planNotStarted(plan, nowMs),
     outsideMeasurements: [],
+    outsideBlackouts: [],
     overlappingPlans: [],
     overflows: [],
     missingLimits: [],
@@ -442,6 +712,32 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
     }
   }
 
+  // 1b) 已登记停灯记录永久保留，必须同样完整落在某个新开灯窗内（停灯不可改删）
+  const ownBlackoutRows = await getBlackoutRows(client, plan.exhibit_id, { planId: plan.id });
+  for (const b of ownBlackoutRows) {
+    const seg = {
+      start: new Date(b.start_ts).getTime(),
+      end: new Date(b.end_ts).getTime(),
+    };
+    if (!targetWindows.some((w) => containsInterval(w, seg))) {
+      conflicts.outsideBlackouts.push({
+        id: b.id,
+        start: tsToWallString(seg.start),
+        end: tsToWallString(seg.end),
+        reason: b.reason,
+      });
+    }
+  }
+  const ownBlackoutAllWindows = ownBlackoutRows.map((b) => ({
+    start: new Date(b.start_ts).getTime(),
+    end: new Date(b.end_ts).getTime(),
+  }));
+  // 新窗内的本计划停灯有效区间（停灯与已确认实测业务互斥，防御性再扣实测覆盖）
+  const ownBlackoutsInNew = [];
+  for (const hole of ownBlackoutAllWindows) {
+    for (const part of clipIntervalToWindows(hole, targetWindows)) ownBlackoutsInNew.push(part);
+  }
+
   // 2) 与同展品其他已批准/待复核计划的开灯时刻重叠
   const others = await getOccupyingPlans(client, plan.exhibit_id, plan.id);
   for (const other of others) {
@@ -462,23 +758,31 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
   const coverers = confirmedMeas
     .map((m) => ({ start: new Date(m.start_ts).getTime(), end: new Date(m.end_ts).getTime() }))
     .filter((mw) => targetWindows.some((w) => intersects(w, mw)));
-  const newRemaining = subtractIntervals(targetWindows, coverers);
+  // 新残余 = 新窗 − 已确认实测覆盖 − 落在新窗内的本计划停灯（统一扣减口径）
+  const newRemaining = subtractIntervals(targetWindows, [...coverers, ...ownBlackoutsInNew]);
   const newResidueYearly = yearMapToObject(doseByYear(newRemaining, Number(adjInput.estimated_lux)));
 
   const occupancy = await computeOccupancy(client, plan.exhibit_id, { excludePlanId: plan.id });
   const limits = occupancy.limits;
   const occupiedWithoutPlan = occupancy.used;
 
-  // 原残余按年（与 computeOccupancy 对本计划的口径一致）
+  // 原残余按年（与 computeOccupancy 对本计划的口径一致：原窗 − 全展品已确认实测 − 本计划停灯）
   const oldWindows = planWindows(plan);
   const allConfirmed = await getActiveMeasurements(client, plan.exhibit_id);
   const allMeasWindows = allConfirmed.map((m) => ({
     start: new Date(m.start_ts).getTime(),
     end: new Date(m.end_ts).getTime(),
   }));
+  const ownBlackoutsInOld = [];
+  for (const hole of ownBlackoutAllWindows) {
+    for (const part of clipIntervalToWindows(hole, oldWindows)) ownBlackoutsInOld.push(part);
+  }
   const oldRemaining = subtractIntervals(
     oldWindows,
-    allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw)))
+    [
+      ...allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw))),
+      ...ownBlackoutsInOld,
+    ]
   );
   const oldResidue = yearMapToObject(doseByYear(oldRemaining, Number(plan.estimated_lux)));
 
@@ -521,6 +825,7 @@ async function evaluateAdjustment(client, plan, adjInput, nowMs = Date.now()) {
     !conflicts.notApproved &&
     !conflicts.notStarted &&
     conflicts.outsideMeasurements.length === 0 &&
+    conflicts.outsideBlackouts.length === 0 &&
     conflicts.overlappingPlans.length === 0 &&
     conflicts.overflows.length === 0 &&
     conflicts.missingLimits.length === 0;
@@ -559,6 +864,7 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
     notApproved: [],
     notStarted: [],
     outsideMeasurements: [],
+    outsideBlackouts: [],
     pairOverlap: false,
     overlappingPlans: [],
     overflows: [],
@@ -577,6 +883,7 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
 
   // 2) 各计划未作废实测必须完整落在各自新开灯窗内；同时收集各计划已确认实测
   const measByPlan = new Map();
+  const blackoutsByPlan = new Map();
   for (const { plan, adj, windows } of pair) {
     const { rows: measRows } = await client.query(
       `SELECT id, start_ts, end_ts, status, actual_lux
@@ -600,6 +907,26 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
           lux: Number(m.actual_lux),
           start: tsToWallString(seg.start),
           end: tsToWallString(seg.end),
+        });
+      }
+    }
+
+    // 停灯记录永久保留，同样必须完整落在各自新开灯窗内
+    const bRows = await getBlackoutRows(client, plan.exhibit_id, { planId: plan.id });
+    blackoutsByPlan.set(Number(plan.id), bRows);
+    for (const b of bRows) {
+      const seg = {
+        start: new Date(b.start_ts).getTime(),
+        end: new Date(b.end_ts).getTime(),
+      };
+      if (!windows.some((w) => containsInterval(w, seg))) {
+        conflicts.outsideBlackouts.push({
+          adjustmentId: adj.id,
+          planId: plan.id,
+          id: b.id,
+          start: tsToWallString(seg.start),
+          end: tsToWallString(seg.end),
+          reason: b.reason,
         });
       }
     }
@@ -638,20 +965,36 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
 
   const items = [];
   for (const { plan, adj, windows } of pair) {
-    // 原残余：原窗扣除本展品全部已确认实测覆盖（与 computeOccupancy 对本计划的口径一致）
+    // 本计划全部停灯窗（登记时已保证落在原窗内且不与实测相交）
+    const ownBlackoutHoles = (blackoutsByPlan.get(Number(plan.id)) || []).map((b) => ({
+      start: new Date(b.start_ts).getTime(),
+      end: new Date(b.end_ts).getTime(),
+    }));
+    const clipHoles = (targetWindows) => {
+      const out = [];
+      for (const hole of ownBlackoutHoles) {
+        for (const part of clipIntervalToWindows(hole, targetWindows)) out.push(part);
+      }
+      return out;
+    };
+
+    // 原残余：原窗扣除本展品全部已确认实测覆盖与本计划停灯（与 computeOccupancy 口径一致）
     const oldWindows = planWindows(plan);
     const oldRemaining = subtractIntervals(
       oldWindows,
-      allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw)))
+      [
+        ...allMeasWindows.filter((mw) => oldWindows.some((w) => intersects(w, mw))),
+        ...clipHoles(oldWindows),
+      ]
     );
     const oldResidueYearly = yearMapToObject(doseByYear(oldRemaining, Number(plan.estimated_lux)));
 
-    // 新残余：新窗扣除本计划已确认实测覆盖（draft 不计量、仍由估算占位）
+    // 新残余：新窗扣除本计划已确认实测覆盖（draft 不计量、仍由估算占位）与落在新窗内的本计划停灯
     const confirmedOwn = (measByPlan.get(Number(plan.id)) || [])
       .filter((m) => m.status === 'confirmed')
       .map((m) => ({ start: new Date(m.start_ts).getTime(), end: new Date(m.end_ts).getTime() }))
       .filter((mw) => windows.some((w) => intersects(w, mw)));
-    const newRemaining = subtractIntervals(windows, confirmedOwn);
+    const newRemaining = subtractIntervals(windows, [...confirmedOwn, ...clipHoles(windows)]);
     const newResidueYearly = yearMapToObject(doseByYear(newRemaining, Number(adj.estimated_lux)));
 
     items.push({
@@ -716,6 +1059,7 @@ async function evaluateAdjustmentPair(client, planA, adjA, planB, adjB, nowMs = 
     conflicts.notApproved.length === 0 &&
     conflicts.notStarted.length === 0 &&
     conflicts.outsideMeasurements.length === 0 &&
+    conflicts.outsideBlackouts.length === 0 &&
     !conflicts.pairOverlap &&
     conflicts.overlappingPlans.length === 0 &&
     conflicts.overflows.length === 0 &&
@@ -860,6 +1204,21 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
     ? planResidues.filter((p) => p.status === 'approved' && !p.notStarted)
     : [];
 
+  // 该年各条停灯记录的估算扣减量（与占用口径一致；已取消计划的停灯 deductionActive=false）
+  const blackoutDeductions = (occupancy.blackouts || [])
+    .filter((b) => (b.yearly[yearStr] || 0) > 0)
+    .map((b) => ({
+      id: b.id,
+      planId: b.planId,
+      planTitle: b.planTitle,
+      planStatus: b.planStatus,
+      start: b.start,
+      end: b.end,
+      reason: b.reason,
+      yearDeduction: round3(b.yearly[yearStr]),
+      active: b.deductionActive,
+    }));
+
   // ---- 凭证指纹快照：覆盖上限/未作废实测/占用计划/时刻 ----
   const { rows: allMeasRows } = await client.query(
     `SELECT id, plan_id, start_ts, end_ts, actual_lux, status
@@ -895,6 +1254,16 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
     .map((p) => p.id)
     .sort((a, b) => a - b);
 
+  // 停灯记录也属于“相关占用”：新增/变化须使旧预演凭证失效
+  const fingerprintBlackouts = (occupancy.blackouts || []).map((b) => ({
+    id: b.id,
+    planId: b.planId,
+    start: b.start,
+    end: b.end,
+    yearly: b.yearly,
+    active: b.deductionActive,
+  }));
+
   return {
     exhibitId,
     year,
@@ -906,12 +1275,14 @@ async function computeLimitPreview(client, exhibitId, year, proposedLimit, { now
     over: excess > 0,
     confirmedMeasurements,
     planResidues,
+    blackoutDeductions,
     flagCandidates,
     startedResiduePlans,
     signature: {
       currentLimit,
       measurements: fingerprintMeasures,
       plans: fingerprintPlans,
+      blackouts: fingerprintBlackouts,
       startedPlanIds,
     },
   };
@@ -926,6 +1297,10 @@ module.exports = {
   planWindows,
   planResidueYearly,
   findOverlappingMeasurement,
+  findOverlappingBlackout,
+  getBlackoutRows,
+  loadBlackoutView,
+  registerBlackout,
   computeOccupancy,
   buildOverflows,
   planOverlaps,

@@ -50,12 +50,20 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     )
   ).rows.map(serializeMeasurement);
 
+  // 停灯记录（保留、不可改删）及各年扣减量；既有查询字段不变，仅附加新字段
+  // 延迟 require 以避免与 routes/blackouts 形成循环依赖
+  const { serializeBlackoutViewItem } = require('./blackouts');
+  const blackouts = (occupancy.blackouts || []).map(serializeBlackoutViewItem);
+  const blackoutDeductionYearly = occupancy.blackoutDeductionYearly || {};
+
   return {
     exhibit,
     years: occupancy.years,
     sources: occupancy.sources,
     plans,
     measurements,
+    blackouts,
+    blackoutDeductionYearly,
   };
 }
 

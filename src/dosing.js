@@ -109,6 +109,26 @@ function anyIntersect(windowsA, windowsB) {
 }
 
 /**
+ * 取 hole 与一组外层区间 windows 的相交部分（已合并，左闭右开）。
+ * 用于计算停灯时段落在计划开灯窗内（且未被已确认实测覆盖）的有效部分。
+ */
+function clipIntervalToWindows(hole, windows) {
+  const parts = [];
+  for (const w of windows) {
+    if (!intersects(w, hole)) continue;
+    parts.push({ start: Math.max(w.start, hole.start), end: Math.min(w.end, hole.end) });
+  }
+  parts.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const p of parts) {
+    const last = merged[merged.length - 1];
+    if (last && p.start <= last.end) last.end = Math.max(last.end, p.end);
+    else merged.push(p);
+  }
+  return merged.filter((p) => p.end > p.start);
+}
+
+/**
  * 把时间窗按墙上自然年切分，返回 Map<year, 分钟数>。
  * 年界（本地 1 月 1 日 00:00）= Date.UTC(y,0,1) - offset。
  */
@@ -197,6 +217,7 @@ module.exports = {
   intersects,
   containsInterval,
   anyIntersect,
+  clipIntervalToWindows,
   splitMinutesByYear,
   doseByYear,
   subtractIntervals,

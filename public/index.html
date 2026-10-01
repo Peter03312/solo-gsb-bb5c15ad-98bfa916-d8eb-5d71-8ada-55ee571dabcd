@@ -108,6 +108,29 @@
             <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>实测照度</th><th>状态</th><th>操作</th></tr></thead>
             <tbody id="detail-meas-tbody"></tbody>
           </table>
+
+          <h4>停灯记录（永久保留，不可修改/删除）</h4>
+          <p class="muted small">停灯只从所属计划“未被已确认实测覆盖”的估算时段中扣减（按自然年拆分）；
+            不减已确认实测，也不释放原计划排期占用。停灯时段与未作废实测互斥。布展员只读。</p>
+          <table class="data">
+            <thead><tr><th>#</th><th>计划</th><th>开始</th><th>结束</th><th>停灯原因</th><th>按年估算扣减 lx·h</th><th>登记人</th></tr></thead>
+            <tbody id="detail-blackout-tbody"></tbody>
+          </table>
+          <form id="blackout-form" class="inline-form conservator-only">
+            <span>登记已发生停灯：</span>
+            <select name="planId" id="blackout-plan-select" required></select>
+            <input name="startDate" type="date" required />
+            <input name="startTime" type="time" required />
+            <span>至</span>
+            <input name="endDate" type="date" />
+            <input name="endTime" type="time" required />
+            <input name="reason" maxlength="1000" placeholder="停灯原因（必填）" required />
+            <button class="primary">登记停灯</button>
+          </form>
+          <p class="muted small conservator-only">
+            起点须早于终点，结束不得晚于当前时间；时段必须完整落在所选计划的开灯窗内，
+            且不得与同展品未作废实测或其他停灯记录相交。失败会指出冲突且不保存。
+          </p>
         </div>
       </section>
 

@@ -160,7 +160,7 @@ async function approve(req, res) {
       );
     }
 
-    // 2) 年度额度检查（本计划估算残余 = 自身实测已覆盖之外的部分）
+    // 2) 年度额度检查（本计划估算残余 = 自身实测与停灯已覆盖之外的部分，统一扣减口径）
     const occupancy = await computeOccupancy(client, plan.exhibit_id, { excludePlanId: id });
     const { rows: measRows } = await client.query(
       `SELECT start_ts, end_ts FROM measurements WHERE plan_id = $1 AND status = 'confirmed'`,
@@ -170,7 +170,15 @@ async function approve(req, res) {
       start: new Date(m.start_ts).getTime(),
       end: new Date(m.end_ts).getTime(),
     }));
-    const remainingWindows = subtractIntervals(targetWindows, selfMeas);
+    const { rows: blackoutRows } = await client.query(
+      `SELECT start_ts, end_ts FROM blackouts WHERE plan_id = $1 ORDER BY id`,
+      [id]
+    );
+    const selfBlackouts = blackoutRows.map((b) => ({
+      start: new Date(b.start_ts).getTime(),
+      end: new Date(b.end_ts).getTime(),
+    }));
+    const remainingWindows = subtractIntervals(targetWindows, [...selfMeas, ...selfBlackouts]);
     const addedYearly = yearMapToObject(doseByYear(remainingWindows, Number(plan.estimated_lux)));
 
     const overflows = buildOverflows(occupancy.used, occupancy.limits, addedYearly);

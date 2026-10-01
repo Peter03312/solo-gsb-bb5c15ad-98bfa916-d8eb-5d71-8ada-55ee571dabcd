@@ -458,6 +458,11 @@ function pairConflictMessages(evalResult, planA, planB) {
       `计划 #${m.planId} 的未作废实测 #${m.id}（${m.start} ~ ${m.end}，${m.status}）不在其新开灯窗内`
     );
   }
+  for (const b of c.outsideBlackouts || []) {
+    parts.push(
+      `计划 #${b.planId} 的停灯记录 #${b.id}（${b.start} ~ ${b.end}）不在其新开灯窗内（停灯保留、不可改删）`
+    );
+  }
   if (c.pairOverlap) parts.push('两份拟改开灯窗彼此重叠');
   for (const p of c.overlappingPlans) {
     parts.push(
@@ -624,6 +629,11 @@ router.post('/:id/approve', requireRole('conservator'), async (req, res, next) =
         for (const m of c.outsideMeasurements) {
           parts.push(
             `未作废实测 #${m.id}（${m.start} ~ ${m.end}，${m.status}）不在新开灯窗内`
+          );
+        }
+        for (const b of c.outsideBlackouts || []) {
+          parts.push(
+            `停灯记录 #${b.id}（${b.start} ~ ${b.end}）不在新开灯窗内（停灯记录保留、不可改删，请把新窗覆盖该时段）`
           );
         }
         for (const p of c.overlappingPlans) {
